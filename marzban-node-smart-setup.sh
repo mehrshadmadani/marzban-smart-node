@@ -4,7 +4,8 @@
 MARZBAN_NODE_DIR="$HOME/Marzban-node"
 MARZBAN_NODE_LIB_DIR="/var/lib/marzban-node"
 DOCKER_COMPOSE_FILE="$MARZBAN_NODE_DIR/docker-compose.yml"
-PYTHON_API_HANDLER_SCRIPT="marzban_api_handler_custom.py" # Custom Python script name
+ITSAML_PYTHON_SCRIPT_URL="https://raw.githubusercontent.com/ItsAML/MarzbanEZNode/main/curlscript.py"
+ITSAML_PYTHON_SCRIPT_NAME="itsaml_curlscript_manual.py" # Unique name for clarity
 
 # --- Helper Functions (Finglish) ---
 log_info() {
@@ -17,307 +18,92 @@ log_warning() {
 
 log_error() {
     echo -e "\e[31m[ERROR]\e[0m $1"
-    exit 1
+    # Do NOT exit 1 here, let the main function decide if it's fatal
 }
 
-# Function to check if a Python library is installed (system-wide)
-check_python_library() {
-    python3 -c "import $1" &> /dev/null
-}
-
-# Function to install Python library via pip (system-wide)
-install_python_library_pip() {
-    local lib_package="$1"
-    log_info "Installing Python library: $lib_package via pip..."
-    if ! pip3 install "$lib_package" --break-system-packages &> /dev/null; then
-        log_error "Failed to install $lib_package. Please check Python/pip installation."
-    fi
-}
-
-# Function to check if a port is in use by ANY service defined in docker-compose.yml
-is_port_in_use_in_compose() {
-    local port_to_check="$1"
-    # Use grep -q for performance and direct check
-    if grep -q "SERVICE_PORT: \"$port_to_check\"" "$DOCKER_COMPOSE_FILE" || \
-       grep -q "XRAY_API_PORT: \"$port_to_check\"" "$DOCKER_COMPOSE_FILE" ; then
-        return 0 # Port found in compose
-    fi
-
-    # Also check ports in 'ports' section for port mapping
-    # This checks lines like '- 8080:80' where 8080 is the external port
-    if awk -v p="$port_to_check" '
-        /^\s*ports:/ {in_ports_block=1; next}
-        /^\s*[a-zA-Z0-9_-]+:$/ {in_ports_block=0} # End of service or ports block
-        in_ports_block && /^\s*-\s*[[:digit:]]+:[[:digit:]]+/ {
-            split($0, arr, ":"); # Split by :
-            gsub(/[^0-9]/, "", arr[1]); # Remove non-digits from external port
-            if (arr[1] == p) {exit 0} # Found
-        }
-        END {exit 1} # Not found
-    ' "$DOCKER_COMPOSE_FILE" >/dev/null 2>&1; then
-        return 0 # Port found in ports section
-    fi
-    return 1 # Port not found
-}
-
-
-# Function to get a random unused port (checks system and compose)
-get_random_free_port() {
-    local start_port=61000
-    local end_port=65000
-    local port_found=""
-
-    for ((port=start_port; port<=end_port; port++)); do
-        local port_in_use_system=false
-        # Check if port is open on system (using ss as netstat might not be installed)
-        if command -v netstat >/dev/null; then
-            if sudo netstat -tuln | grep -q ":$port\b"; then
-                port_in_use_system=true
-            fi
-        elif command -v ss >/dev/null; then
-            if sudo ss -tuln | grep -q ":$port\b"; then
-                port_in_use_system=true
-            fi
-        fi
-
-        if [ "$port_in_use_system" = false ]; then
-            if ! is_port_in_use_in_compose "$port"; then
-                echo "$port"
-                return 0
-            fi
-        fi
-    done
-    return 1 # No free port found
-}
-
-# --- Prerequisites Check ---
-check_prerequisites() {
-    log_info "Checking prerequisites..."
-    local missing_pkgs=()
-
-    command -v curl >/dev/null || missing_pkgs+=("curl")
-    command -v socat >/dev/null || missing_pkgs+=("socat")
-    command -v git >/dev/null || missing_pkgs+=("git")
-    command -v docker >/dev/null || missing_pkgs+=("docker")
-    command -v docker-compose >/dev/null || missing_pkgs+=("docker-compose")
-    command -v python3 >/dev/null || missing_pkgs+=("python3")
-    command -v pip3 >/dev/null || missing_pkgs+=("python3-pip") # pip is usually part of python3-pip apt package
-    # net-tools is for netstat. ss is usually part of iproute2 (preinstalled).
-    if ! command -v netstat >/dev/null && ! command -v ss >/dev/null; then
-        missing_pkgs+=("net-tools") # Recommend net-tools if neither found for port check
-    fi
-
-    if [ ${#missing_pkgs[@]} -gt 0 ]; then
-        log_warning "Missing packages: ${missing_pkgs[*]}. Installing them..."
-        sudo apt-get update || log_error "Failed to update apt-get."
-        sudo apt-get install -y "${missing_pkgs[@]}" || log_error "Failed to install prerequisites."
-    fi
-
-    if ! command -v docker >/dev/null; then
-        log_info "Docker is not installed. Installing Docker..."
-        curl -fsSL https://get.docker.com | sh || log_error "Failed to install Docker."
-        sudo systemctl start docker
-        sudo systemctl enable docker
-    fi
-
-    if ! command -v docker-compose >/dev/null; then
-        log_info "docker-compose is not installed. Installing docker-compose..."
-        sudo apt-get install -y docker-compose || log_error "Failed to install docker-compose."
-    fi
-    
-    # Install requests needed by our custom Python script
-    if ! check_python_library "requests"; then
+# --- Prerequisites Check (simplified, as ItsAML's script also installs them) ---
+check_minimal_prerequisites() {
+    log_info "Checking minimal prerequisites (curl, git, python3, pip3)..."
+    command -v curl >/dev/null || { sudo apt-get update && sudo apt-get install -y curl || log_error "Failed to install curl."; }
+    command -v git >/dev/null || { sudo apt-get update && sudo apt-get install -y git || log_error "Failed to install git."; }
+    command -v python3 >/dev/null || { sudo apt-get update && sudo apt-get install -y python3 || log_error "Failed to install python3."; }
+    command -v pip3 >/dev/null || { sudo apt-get update && sudo apt-get install -y python3-pip || log_error "Failed to install pip3."; }
+    # Ensure requests and paramiko are installed for curlscript.py
+    if ! python3 -c "import requests" &> /dev/null; then
         log_info "Python 'requests' library not found. Installing..."
-        install_python_library_pip "requests"
+        pip3 install requests --break-system-packages || log_error "Failed to install 'requests' library."
     fi
-
-    log_info "All prerequisites are installed."
-}
-
-# --- Marzban-node Base Setup ---
-setup_marzban_node_base() {
-    log_info "Setting up Marzban-node base files..."
-
-    if [ ! -d "$MARZBAN_NODE_DIR" ]; then
-        log_info "Cloning Marzban-node repository..."
-        git clone https://github.com/Gozargah/Marzban-node "$MARZBAN_NODE_DIR" || log_error "Failed to clone repository."
-    else
-        log_info "Marzban-node repository already exists. Updating it..."
-        cd "$MARZBAN_NODE_DIR" && git pull || log_warning "Failed to update repository. Continuing..."
+    if ! python3 -c "import paramiko" &> /dev/null; then
+        log_info "Python 'paramiko' library not found. Installing..."
+        pip3 install paramiko --break-system-packages || log_error "Failed to install 'paramiko' library."
     fi
-
-    if [ ! -d "$MARZBAN_NODE_LIB_DIR" ]; then
-        log_info "Creating directory $MARZBAN_NODE_LIB_DIR for SSL certs and node data..."
-        sudo mkdir -p "$MARZBAN_NODE_LIB_DIR" || log_error "Failed to create directory."
-    fi
-
-    log_info "Marzban-node base setup complete."
-}
-
-# --- Custom Python API Handler Setup ---
-setup_custom_python_api_handler() {
-    log_info "Setting up custom Python API handler script for Marzban interaction."
-    
-    # Create the Python script for API interaction directly
-    # Using 'EOF' without quotes, allows shell variables to expand, useful for dynamic paths.
-    # But for a script we want exact content, so use 'EOF'
-    cat << 'EOF' > "$MARZBAN_NODE_DIR/$PYTHON_API_HANDLER_SCRIPT"
-import requests
-import json
-import sys
-import os
-import urllib.parse # For URL parsing
-
-# Disable urllib3 warnings about unverified HTTPS requests (for self-signed certs)
-requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
-
-def log_py(message):
-    # This function logs to stderr so it doesn't interfere with stdout output (certificate)
-    print(f"[PY_LOG] {message}", file=sys.stderr)
-
-def get_token(panel_protocol, panel_domain, panel_port, username, password):
-    # Construct URL for /api/admin/token
-    panel_api_url = f"{panel_protocol}://{panel_domain}"
-    if not ((panel_protocol == "http" and panel_port == "80") or (panel_protocol == "https" and panel_port == "443")):
-        panel_api_url += f":{panel_port}"
-    panel_api_url += "/api/admin/token" # Marzban's standard API token endpoint
-
-    log_py(f"Attempting to login to {panel_api_url}...")
-    headers = {"Content-Type": "application/json"}
-    data = json.dumps({"username": username, "password": password})
-    try:
-        response = requests.post(url=panel_api_url, data=data, headers=headers, verify=False)
-        response.raise_for_status() # Raise an exception for HTTP errors
-        return response.json().get("access_token")
-    except requests.exceptions.RequestException as e:
-        log_py(f"Login failed: {e}. Check Panel URL, username, and password.")
-        return None
-
-def get_client_cert(panel_protocol, panel_domain, panel_port, token):
-    # Construct URL for /api/admin/nodes/certificate
-    panel_api_url = f"{panel_protocol}://{panel_domain}"
-    if not ((panel_protocol == "http" and panel_port == "80") or (panel_protocol == "https" and panel_port == "443")):
-        panel_api_url += f":{panel_port}"
-    panel_api_url += "/api/admin/nodes/certificate" # Marzban's standard API endpoint for node cert
-
-    log_py(f"Attempting to retrieve client certificate from {panel_api_url}...")
-    headers = {"Authorization": f"Bearer {token}"}
-    try:
-        response = requests.get(url=panel_api_url, headers=headers, verify=False)
-        response.raise_for_status()
-        cert = response.json()
-        return cert.get("certificate") # Using .get() for safety
-    except requests.exceptions.RequestException as e:
-        log_py(f"Failed to retrieve certificate: {e}. Check API access or Panel version.")
-        return None
-
-def add_node_to_panel(panel_protocol, panel_domain, panel_port, token, node_name, node_address, service_port, api_port, add_as_new_host):
-    # Construct URL for /api/admin/nodes
-    panel_api_url = f"{panel_protocol}://{panel_domain}"
-    if not ((panel_protocol == "http" and panel_port == "80") or (panel_protocol == "https" and panel_port == "443")):
-        panel_api_url += f":{panel_port}"
-    panel_api_url += "/api/admin/nodes" # Marzban's standard API endpoint for adding nodes
-
-    log_py(f"Attempting to add node '{node_name}' to {panel_api_url}...")
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
-    node_information = {
-        "name": node_name,
-        "address": node_address,
-        "port": int(service_port),
-        "api_port": int(api_port),
-        "add_as_new_host": add_as_new_host, # Pass boolean directly
-        "usage_coefficient": 1
-    }
-    data = json.dumps(node_information)
-    
-    try:
-        response = requests.post(url=panel_api_url, data=data, headers=headers, verify=False)
-        response.raise_for_status()
-        result = response.json()
-        if response.status_code in [200, 201]: # 200 for update, 201 for create
-            log_py(f"Node '{node_name}' successfully added/updated to panel.")
-            return True
-        else:
-            log_py(f"Failed to add/update node. Status: {response.status_code}, Response: {result}")
-            return False
-    except requests.exceptions.RequestException as e:
-        log_py(f"Failed to add/update node to panel: {e}")
-        return False
-
-if __name__ == "__main__":
-    # Arguments: <panel_domain> <panel_port> <panel_protocol_bool_str> <username> <password> <node_name> <node_address> <service_port> <api_port> <add_as_new_host_bool_str>
-    if len(sys.argv) < 11:
-        log_py("Usage: python marzban_api_handler_custom.py <domain> <port> <https_bool> <username> <password> <node_name> <node_address> <service_port> <api_port> <add_as_new_host_bool_str>")
-        sys.exit(1)
-
-    panel_domain = sys.argv[1]
-    panel_port = sys.argv[2]
-    https_enabled = sys.argv[3].lower() == 'true' # Convert string "True"/"False" to boolean True/False
-    username = sys.argv[4]
-    password = sys.argv[5]
-    node_name = sys.argv[6]
-    node_address = sys.argv[7]
-    service_port = sys.argv[8]
-    api_port = sys.argv[9]
-    add_as_new_host = sys.argv[10].lower() == 'true' # Convert string "True"/"False" to boolean True/False
-
-    panel_protocol = "https" if https_enabled else "http"
-
-    token = get_token(panel_domain, panel_port, https_enabled, username, password)
-    if not token:
-        sys.exit(1)
-
-    cert_content = get_client_cert(panel_domain, panel_port, https_enabled, token)
-    if not cert_content:
-        sys.exit(1)
-    
-    # Print cert_content to stdout as the ONLY thing for Bash to capture for cert file
-    print(cert_content)
-
-    if not add_node_to_panel(panel_domain, panel_port, https_enabled, token, node_name, node_address, service_port, api_port, add_as_new_host):
-        sys.exit(1)
-
-    sys.exit(0) # Explicitly exit with 0 on success
-EOF
-    
-    chmod +x "$MARZBAN_NODE_DIR/$PYTHON_API_HANDLER_SCRIPT" || log_error "Failed to make Python script executable."
-    log_info "Python API handler setup complete."
+    log_info "Minimal prerequisites are checked."
 }
 
 # --- Main Execution Flow ---
 main() {
-    log_info "Starting Marzban Node deployment/addition script (Smart Mode)."
+    log_info "Starting Marzban Node setup and addition (Semi-Automated Guide)."
+    log_info "This script will guide you through using ItsAML's curlscript.py."
+    log_warning "Please read the prompts carefully and enter required information manually."
     
-    check_prerequisites
-    setup_marzban_node_base
-    setup_custom_python_api_handler # Setup Python and custom API script
+    check_minimal_prerequisites
+    
+    log_info "\n--- Step 1: Prepare Marzban-node Base ---"
+    log_info "Cloning/Updating Marzban-node repository and creating necessary directories."
+    if [ ! -d "$MARZBAN_NODE_DIR" ]; then
+        git clone https://github.com/Gozargah/Marzban-node "$MARZBAN_NODE_DIR" || log_error "Failed to clone repository."
+    else
+        cd "$MARZBAN_NODE_DIR" && git pull || log_warning "Failed to update repository. Continuing..."
+    fi
+    sudo mkdir -p "$MARZBAN_NODE_LIB_DIR" || log_error "Failed to create /var/lib/marzban-node directory."
+    log_info "Marzban-node base setup complete."
 
-    # --- Initial docker-compose.yml creation if not exists ---
-    if [ ! -f "$DOCKER_COMPOSE_FILE" ]; then
-        log_warning "docker-compose.yml not found. Creating a new, empty docker-compose.yml with 'services:' header."
-        echo "services:" > "$DOCKER_COMPOSE_FILE"
-        log_info "Empty docker-compose.yml created. Now proceeding to add your first node service."
+    log_info "\n--- Step 2: Run ItsAML's curlscript.py ---"
+    log_info "This script will interactively ask for your Marzban Panel and Node details."
+    log_info "It will install Docker/Docker Compose (if not present), configure ONE Marzban Node service, and add it to your panel."
+    log_warning "This will OVERWRITE your current docker-compose.yml with a single node service."
+    
+    log_info "Downloading ItsAML's curlscript.py..."
+    curl -sSL "$ITSAML_PYTHON_SCRIPT_URL" > "$MARZBAN_NODE_DIR/$ITSAML_PYTHON_SCRIPT_NAME" || log_error "Failed to download curlscript.py."
+    chmod +x "$MARZBAN_NODE_DIR/$ITSAML_PYTHON_SCRIPT_NAME" || log_error "Failed to make curlscript.py executable."
+    
+    log_info "\nNow, executing ItsAML's curlscript.py. Please answer its questions directly (in English):"
+    log_info "----------------------------------------------------------------------"
+    cd "$MARZBAN_NODE_DIR" # Change to Marzban-node directory for script execution
+    python3 "$ITSAML_PYTHON_SCRIPT_NAME"
+    local curlscript_exit_code=$?
+    log_info "----------------------------------------------------------------------"
+    
+    if [ "$curlscript_exit_code" -ne 0 ]; then
+        log_error "ItsAML's curlscript.py failed. Please check its output above and try again."
     fi
 
-    add_new_node_to_system # Call the function that handles adding node to Docker and Panel
-
-    log_info "Applying Docker Compose changes..."
-    cd "$MARZBAN_NODE_DIR" || log_error "Failed to enter Marzban-node directory."
+    log_info "\n--- Step 3: Verify Node in Panel ---"
+    log_info "Your new node should now be added to your Marzban Panel."
+    log_info "Go to your Marzban Panel -> Node Settings to confirm its status (should be Green)."
     
-    # Use --remove-orphans to clean up old services that are no longer defined in the updated compose file
-    sudo docker compose down --remove-orphans || log_warning "Failed to stop/remove old containers. Continuing..."
-    sudo docker compose pull || log_warning "Failed to pull Docker images. Continuing..."
-    sudo docker compose up -d || log_error "Failed to start Docker Compose."
+    log_info "\n--- Step 4: Manually Combine docker-compose.yml (if adding more nodes) ---"
+    log_warning "Remember: ItsAML's script installed only ONE node. If you have other nodes/panels to add to this server, you MUST manually edit your docker-compose.yml."
+    log_info "Current docker-compose.yml content (after ItsAML's script):"
+    cat "$DOCKER_COMPOSE_FILE"
+    
+    log_info "\nTo add MORE nodes, you need to manually edit $DOCKER_COMPOSE_FILE:"
+    log_info "1. Use 'nano $DOCKER_COMPOSE_FILE' to open the file."
+    log_info "2. Copy/paste the service blocks for your other nodes (e.g., marzban-node-2, marzban-node-3) below the existing one."
+    log_info "3. Ensure each service has a UNIQUE name (e.g., 'marzban-node-panel1', 'marzban-node-panel2')."
+    log_info "4. Make sure 'SERVICE_PORT' and 'XRAY_API_PORT' for each node are UNIQUE and NOT in use by other services on your server."
+    log_info "5. Ensure the 'SSL_CLIENT_CERT_FILE' path points to the correct certificate file for each panel (e.g., /var/lib/marzban-node/ssl_client_cert_PANEL2_NAME.pem)."
+    log_info "   You will need to manually get certificates for additional panels and save them to /var/lib/marzban-node/ssl_client_cert_YOUR_NODE_NAME.pem."
+    log_info "6. Save changes in nano (Ctrl+X, Y, Enter)."
 
-    log_info "Marzban Node(s) successfully deployed/updated."
+    log_info "\n--- Step 5: Apply Docker Compose Changes ---"
+    log_info "After manually editing $DOCKER_COMPOSE_FILE (if needed), run these commands:"
+    log_info "cd $MARZBAN_NODE_DIR"
+    log_info "sudo docker compose down --remove-orphans"
+    log_info "sudo docker compose pull"
+    log_info "sudo docker compose up -d"
 
-    log_info "\n--- Final Check ---"
-    log_info "Please go to your Marzban Panel -> Node Settings to confirm the new node's status (should be Green)."
-    log_info "Also, remember: In Host Network mode, all inbound ports are exposed. Ensure your Inbound Ports across different Marzban Panels do NOT conflict on this node."
-    log_info "\nAll automated steps completed successfully."
+    log_info "\n--- All steps completed. Please verify your nodes in Marzban Panel. ---"
 }
 
 # Execute main function
