@@ -4,7 +4,7 @@
 MARZBAN_NODE_DIR="$HOME/Marzban-node"
 MARZBAN_NODE_LIB_DIR="/var/lib/marzban-node"
 DOCKER_COMPOSE_FILE="$MARZBAN_NODE_DIR/docker-compose.yml"
-PYTHON_API_HANDLER_SCRIPT="marzban_api_handler_custom.py" # Our custom Python script
+PYTHON_API_HANDLER_SCRIPT="marzban_api_handler_custom.py" # Custom Python script name
 
 # --- Helper Functions (Finglish) ---
 log_info() {
@@ -37,27 +37,27 @@ install_python_library_pip() {
 # Function to check if a port is in use by ANY service defined in docker-compose.yml
 is_port_in_use_in_compose() {
     local port_to_check="$1"
-    # Check if the port is used in any SERVICE_PORT or XRAY_API_PORT in any service environment section
-    awk -v p="$port_to_check" '
-        /^\s*-/ {in_ports_block=1; next} # Lines starting with - in ports section
-        /^\s*ports:/ {in_ports_block=1; next} # Explicit ports block
-        /^\s*environment:/ {in_env_block=1; next} # Environment block
-        /^[a-zA-Z0-9_-]+:$/ {in_ports_block=0; in_env_block=0} # New service block
+    # Use grep -q for performance and direct check
+    if grep -q "SERVICE_PORT: \"$port_to_check\"" "$DOCKER_COMPOSE_FILE" || \
+       grep -q "XRAY_API_PORT: \"$port_to_check\"" "$DOCKER_COMPOSE_FILE" ; then
+        return 0 # Port found in compose
+    fi
 
-        in_ports_block {
-            split($0, arr, ":"); # Split by : for port mapping
-            # Check the external port (before colon)
-            gsub(/ /, "", arr[1]); # Remove quotes
-            if (arr[1] == p) {found=1; exit}
+    # Also check ports in 'ports' section for port mapping
+    # This checks lines like '- 8080:80' where 8080 is the external port
+    if awk -v p="$port_to_check" '
+        /^\s*ports:/ {in_ports_block=1; next}
+        /^\s*[a-zA-Z0-9_-]+:$/ {in_ports_block=0} # End of service or ports block
+        in_ports_block && /^\s*-\s*[[:digit:]]+:[[:digit:]]+/ {
+            split($0, arr, ":"); # Split by :
+            gsub(/[^0-9]/, "", arr[1]); # Remove non-digits from external port
+            if (arr[1] == p) {exit 0} # Found
         }
-        in_env_block {
-            if ($1 == "SERVICE_PORT:" || $1 == "XRAY_API_PORT:") {
-                gsub(/"/, "", $NF); # Remove quotes
-                if ($NF == p) {found=1; exit}
-            }
-        }
-        END {exit !found}
-    ' "$DOCKER_COMPOSE_FILE" >/dev/null 2>&1
+        END {exit 1} # Not found
+    ' "$DOCKER_COMPOSE_FILE" >/dev/null 2>&1; then
+        return 0 # Port found in ports section
+    fi
+    return 1 # Port not found
 }
 
 
@@ -159,6 +159,8 @@ setup_custom_python_api_handler() {
     log_info "Setting up custom Python API handler script for Marzban interaction."
     
     # Create the Python script for API interaction directly
+    # Using 'EOF' without quotes, allows shell variables to expand, useful for dynamic paths.
+    # But for a script we want exact content, so use 'EOF'
     cat << 'EOF' > "$MARZBAN_NODE_DIR/$PYTHON_API_HANDLER_SCRIPT"
 import requests
 import json
