@@ -4,7 +4,7 @@
 MARZBAN_NODE_DIR="$HOME/Marzban-node"
 MARZBAN_NODE_LIB_DIR="/var/lib/marzban-node"
 DOCKER_COMPOSE_FILE="$MARZBAN_NODE_DIR/docker-compose.yml"
-PYTHON_API_HANDLER_SCRIPT="marzban_api_handler_custom.py" # Our custom Python script
+PYTHON_API_HANDLER_SCRIPT="marzban_api_handler_custom.py" # Custom Python script name
 
 # --- Helper Functions (Finglish) ---
 log_info() {
@@ -172,8 +172,7 @@ setup_custom_python_api_handler() {
     log_info "Setting up custom Python API handler script for Marzban interaction."
     
     # Create the Python script for API interaction directly
-    # Using 'EOF' without quotes, allows shell variables to expand, useful for dynamic paths.
-    # But for a script we want exact content, so use 'EOF'
+    # Using 'EOF_PYTHON_SCRIPT' as a unique delimiter
     cat << 'EOF_PYTHON_SCRIPT' > "$MARZBAN_NODE_DIR/$PYTHON_API_HANDLER_SCRIPT"
 import requests
 import json
@@ -294,7 +293,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     sys.exit(0) # Explicitly exit with 0 on success
-EOF
+EOF_PYTHON_SCRIPT
     
     chmod +x "$MARZBAN_NODE_DIR/$PYTHON_API_HANDLER_SCRIPT" || log_error "Failed to make Python script executable."
     log_info "Python API handler setup complete."
