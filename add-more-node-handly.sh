@@ -3,7 +3,7 @@
 # --- Configs ---
 MARZBAN_NODE_DIR="$HOME/Marzban-node"
 MARZBAN_NODE_LIB_DIR="/var/lib/marzban-node"
-DOCKER_COMPOSE_FILE="$MARZBAN_NODE_DIR/opt/marzban-node/docker-compose.yml"
+DOCKER_COMPOSE_FILE="$MARZBAN_NODE_DIR/docker-compose.yml"
 
 # --- Helper Functions ---
 log_info() {
