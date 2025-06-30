@@ -4,8 +4,7 @@
 MARZBAN_NODE_DIR="$HOME/Marzban-node"
 MARZBAN_NODE_LIB_DIR="/var/lib/marzban-node"
 DOCKER_COMPOSE_FILE="$MARZBAN_NODE_DIR/docker-compose.yml"
-# We will use our custom Python script directly for API interaction
-PYTHON_API_HANDLER_SCRIPT="marzban_api_handler_custom.py"
+PYTHON_API_HANDLER_SCRIPT="marzban_api_handler_auto.py" # Custom Python script name
 
 # --- Helper Functions (Finglish) ---
 log_info() {
@@ -38,20 +37,24 @@ install_python_library_pip() {
 # Function to check if a port is in use by ANY service defined in docker-compose.yml
 is_port_in_use_in_compose() {
     local port_to_check="$1"
-    # Iterate through all 'environment' sections to find SERVICE_PORT or XRAY_API_PORT
     awk -v p="$port_to_check" '
-        /^\s*marzban-node-/{in_service=1; service_name=$1; next}
-        /^\s*service:/ {in_service=1; service_name=$1; next} # Catch generic services too
-        in_service && /^\s*environment:/ {in_env=1; next}
-        in_service && in_env && /^\s*SERVICE_PORT:\s*\"?[[:digit:]]+\"?/ {
-            gsub(/"/, "", $NF); # Remove quotes
-            if ($NF == p) {found=1; exit}
+        /^\s*-/ {in_ports_block=1; next} # Lines starting with - in ports section
+        /^\s*environment:/ {in_ports_block=0} # End of ports section or new block
+        in_ports_block {
+            split($0, arr, ":"); # Split by : for port mapping
+            # Check the external port (before colon)
+            gsub(/ /, "", arr[1]); # Remove spaces
+            if (arr[1] == p) {found=1; exit}
         }
-        in_service && in_env && /^\s*XRAY_API_PORT:\s*\"?[[:digit:]]+\"?/ {
-            gsub(/"/, "", $NF); # Remove quotes
-            if ($NF == p) {found=1; exit}
+        # Also check ports in environment variables (for network_mode: host)
+        /SERVICE_PORT:\s*\"?'"'"?[[:digit:]]+/ {
+            gsub(/[^0-9]/, "", $0); # Keep only digits
+            if ($0 == p) {found=1; exit}
         }
-        /^\s*\S.*:$/ {in_service=0; in_env=0} # End of service block
+        /XRAY_API_PORT:\s*\"?'"'"?[[:digit:]]+/{
+            gsub(/[^0-9]/, "", $0); # Keep only digits
+            if ($0 == p) {found=1; exit}
+        }
         END {exit !found}
     ' "$DOCKER_COMPOSE_FILE" >/dev/null 2>&1
 }
@@ -122,7 +125,7 @@ check_prerequisites() {
     fi
     
     # Install requests needed by our custom Python script
-    if ! check_python_library "requests"; then
+    if ! python3 -c "import requests" &> /dev/null; then
         log_info "Python 'requests' library not found. Installing..."
         install_python_library_pip "requests"
     fi
@@ -152,7 +155,7 @@ setup_marzban_node_base() {
 
 # --- Custom Python API Handler Setup ---
 setup_custom_python_api_handler() {
-    log_info "Setting up custom Python API handler script."
+    log_info "Setting up custom Python API handler script for Marzban interaction."
     
     # Create the Python script for API interaction directly
     cat << EOF > "$MARZBAN_NODE_DIR/$PYTHON_API_HANDLER_SCRIPT"
@@ -169,96 +172,112 @@ def log_py(message):
     # This function logs to stderr so it doesn't interfere with stdout output (certificate)
     print(f"[PY_LOG] {message}", file=sys.stderr)
 
-def get_token(panel_api_base_url, username, password):
-    log_py(f"Attempting to login to {panel_api_base_url}/admin/token...")
+def get_token(panel_protocol, panel_domain, panel_port, username, password):
+    # Construct URL for /api/admin/token
+    panel_api_url = f"{panel_protocol}://{panel_domain}"
+    if not ((panel_protocol == "http" and panel_port == "80") or (panel_protocol == "https" and panel_port == "443")):
+        panel_api_url += f":{panel_port}"
+    panel_api_url += "/api/admin/token" # ItsAML's script uses /api/admin/token
+
+    log_py(f"Attempting to login to {panel_api_url}...")
     headers = {"Content-Type": "application/json"}
     data = json.dumps({"username": username, "password": password})
     try:
-        response = requests.post(f"{panel_api_base_url}/admin/token", headers=headers, data=data, verify=False)
+        response = requests.post(url=panel_api_url, data=data, headers=headers, verify=False)
         response.raise_for_status() # Raise an exception for HTTP errors
         return response.json().get("access_token")
     except requests.exceptions.RequestException as e:
-        log_py(f"Login failed: {e}. Check API URL, username, and password.")
+        log_py(f"Login failed: {e}. Check Panel URL, username, and password.")
         return None
 
-def get_client_cert(panel_api_base_url, token):
-    log_py(f"Attempting to retrieve client certificate from {panel_api_base_url}/admin/nodes/certificate...")
+def get_client_cert(panel_protocol, panel_domain, panel_port, token):
+    # Construct URL for /api/admin/nodes/certificate
+    panel_api_url = f"{panel_protocol}://{panel_domain}"
+    if not ((panel_protocol == "http" and panel_port == "80") or (panel_protocol == "https" and panel_port == "443")):
+        panel_api_url += f":{panel_port}"
+    panel_api_url += "/api/admin/nodes/certificate" # ItsAML's script uses /api/node/settings
+
+    log_py(f"Attempting to retrieve client certificate from {panel_api_url}...")
     headers = {"Authorization": f"Bearer {token}"}
     try:
-        response = requests.get(f"{panel_api_base_url}/admin/nodes/certificate", headers=headers, verify=False)
+        response = requests.get(url=panel_api_url, headers=headers, verify=False)
         response.raise_for_status()
-        return response.json().get("cert")
+        cert = response.json()
+        return cert.get("certificate") # Using .get() for safety
     except requests.exceptions.RequestException as e:
         log_py(f"Failed to retrieve certificate: {e}. Check API access or Panel version.")
         return None
 
-def add_node_to_panel(panel_api_base_url, token, node_name, node_address, service_port, api_port):
-    log_py(f"Attempting to add node '{node_name}' to {panel_api_base_url}/admin/nodes...")
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
-    data = json.dumps({
+def add_node_to_panel(panel_protocol, panel_domain, panel_port, token, node_name, node_address, service_port, api_port, add_as_new_host):
+    # Construct URL for /api/admin/nodes
+    panel_api_url = f"{panel_protocol}://{panel_domain}"
+    if not ((panel_protocol == "http" and panel_port == "80") or (panel_protocol == "https" and panel_port == "443")):
+        panel_api_url += f":{panel_port}"
+    panel_api_url += "/api/admin/nodes" # ItsAML's script uses /api/node
+
+    log_py(f"Attempting to add node '{node_name}' to {panel_api_url}...")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+    node_information = {
         "name": node_name,
         "address": node_address,
         "port": int(service_port),
         "api_port": int(api_port),
-        "usage_ratio": 1
-    })
+        "add_as_new_host": add_as_new_host, # Pass boolean directly
+        "usage_coefficient": 1
+    }
+    data = json.dumps(node_information)
+    
     try:
-        response = requests.post(url, data=data, headers=headers, verify=False) # Use data=data for JSON body
+        response = requests.post(url=panel_api_url, data=data, headers=headers, verify=False)
         response.raise_for_status()
         result = response.json()
         if response.status_code in [200, 201]: # 200 for update, 201 for create
-            log_py(f"Node '{node_name}' successfully added/updated.")
+            log_py(f"Node '{node_name}' successfully added/updated to panel.")
             return True
         else:
             log_py(f"Failed to add/update node. Status: {response.status_code}, Response: {result}")
             return False
     except requests.exceptions.RequestException as e:
-        log_py(f"Failed to add/update node: {e}")
+        log_py(f"Failed to add/update node to panel: {e}")
         return False
 
 if __name__ == "__main__":
-    # Arguments: <panel_protocol> <panel_domain> <panel_port> <username> <password> <node_name> <node_address> <service_port> <api_port>
-    if len(sys.argv) < 10:
-        log_py("Usage: python marzban_api_handler_custom.py <protocol> <domain> <port> <username> <password> <node_name> <node_address> <service_port> <api_port>")
+    # Arguments: <panel_domain> <panel_port> <panel_protocol_bool_str> <username> <password> <node_name> <node_address> <service_port> <api_port> <add_as_new_host_bool_str>
+    if len(sys.argv) < 11:
+        log_py("Usage: python marzban_api_handler_auto.py <domain> <port> <https_bool> <username> <password> <node_name> <node_address> <service_port> <api_port> <add_as_new_host_bool_str>")
         sys.exit(1)
 
-    panel_protocol = sys.argv[1]
-    panel_domain = sys.argv[2]
-    panel_port = sys.argv[3]
+    panel_domain = sys.argv[1]
+    panel_port = sys.argv[2]
+    https_enabled = sys.argv[3].lower() == 'true' # Convert string "True"/"False" to boolean True/False
     username = sys.argv[4]
     password = sys.argv[5]
     node_name = sys.argv[6]
     node_address = sys.argv[7]
     service_port = sys.argv[8]
     api_port = sys.argv[9]
+    add_as_new_host = sys.argv[10].lower() == 'true' # Convert string "True"/"False" to boolean True/False
 
-    # Construct the API base URL: <scheme>://<hostname>:<port_if_not_default>/api
-    panel_api_base_url = f"{panel_protocol}://{panel_domain}"
-    
-    # Add port only if it's not a default port for the given scheme
-    if not ((panel_protocol == "http" and panel_port == "80") or \
-            (panel_protocol == "https" and panel_port == "443")):
-        panel_api_base_url += f":{panel_port}"
-    
-    panel_api_base_url += "/api" # Append the common /api endpoint suffix
+    panel_protocol = "https" if https_enabled else "http"
 
-    log_py(f"Constructed API Base URL for Python script: {panel_api_base_url}")
-
-    token = get_token(panel_api_base_url, username, password)
+    token = get_token(panel_domain, panel_port, https_enabled, username, password)
     if not token:
         sys.exit(1)
 
-    cert_content = get_client_cert(panel_api_base_url, token)
+    cert_content = get_client_cert(panel_domain, panel_port, https_enabled, token)
     if not cert_content:
         sys.exit(1)
     
-    # Print cert_content to stdout so bash script can capture it. 
-    # This must be the ONLY thing printed to stdout for successful capture.
+    # Print cert_content to stdout as the ONLY thing for Bash to capture for cert file
     print(cert_content)
 
-    if not add_node_to_panel(panel_api_base_url, token, node_name, node_address, service_port, api_port):
+    # Add Node to Panel
+    if not add_node_to_panel(panel_domain, panel_port, https_enabled, token, node_name, node_address, service_port, api_port, add_as_new_host):
         sys.exit(1)
-
+    
     sys.exit(0) # Explicitly exit with 0 on success
 EOF
     
@@ -280,19 +299,15 @@ add_new_node_to_system() {
     local panel_username
     local panel_password
     local node_display_address
+    local add_as_host_flag_input # y/n
+    local add_as_new_host_bool # True/False for Python script
     local use_auto_ports
 
     log_info "\n--- Enter details for the NEW Marzban Node and Panel connection ---"
     read -p "Enter Marzban Panel Domain (e.g., your-panel.com or 1.2.3.4): " panel_domain_input
     
     read -p "Is your Marzban Panel using HTTPS (y/n)? " use_https_input
-    local panel_protocol_input # http or https
-    if [[ "$use_https_input" =~ ^[Yy]$ ]]; then
-        panel_protocol_input="https"
-    else
-        panel_protocol_input="http"
-    fi
-
+    
     read -p "Enter Marzban Panel Port (e.g., 80, 443, 2003): " panel_port_input
     while [[ ! "$panel_port_input" =~ ^[0-9]+$ ]] || [ "$panel_port_input" -lt 1 ]; do
         log_warning "Invalid port. Please enter a valid positive integer."
@@ -350,6 +365,13 @@ add_new_node_to_system() {
     read -p "Enter Node's Address for Marzban Panel (your node's public IP or a domain, e.g., $public_ip or node.yourdomain.com): " node_display_address
     node_display_address=${node_display_address:-$public_ip} # Use public IP as default
 
+    read -p "Do you want to add this node as a new host for every inbound in Marzban Panel (y/n)? " add_as_host_flag_input
+    if [[ "$add_as_host_flag_input" =~ ^[Yy]$ ]]; then
+        add_as_new_host_bool="True"
+    else
+        add_as_new_host_bool="False"
+    fi
+
 
     client_cert_file_path="${MARZBAN_NODE_LIB_DIR}/ssl_client_cert_${new_service_name}.pem"
 
@@ -357,13 +379,20 @@ add_new_node_to_system() {
     log_info "Attempting to interact with Marzban Panel API via Python script..."
     log_info "Running Python script to get token, client cert, and add node..."
 
+    # Convert Bash boolean-like strings to Python boolean strings
+    local panel_https_bool="False"
+    if [[ "$use_https_input" =~ ^[Yy]$ ]]; then
+        panel_https_bool="True"
+    fi
+
     # Run Python script and capture its output (stderr is redirected to stdout for logging)
     local py_output
-    # Pass protocol, domain, port, username, password, node_name, node_address, service_port, api_port
+    # Pass all arguments to Python script
     py_output=$( python3 "$MARZBAN_NODE_DIR/$PYTHON_API_HANDLER_SCRIPT" \
-        "$panel_protocol_input" "$panel_domain_input" "$panel_port_input" \
+        "$panel_domain_input" "$panel_port_input" "$panel_https_bool" \
         "$panel_username" "$panel_password" \
-        "$new_service_name" "$node_display_address" "$service_port" "$api_port" 2>&1 )
+        "$new_service_name" "$node_display_address" "$service_port" "$api_port" \
+        "$add_as_new_host_bool" 2>&1 )
 
     local py_exit_code=$?
     log_info "Python script raw output:"
