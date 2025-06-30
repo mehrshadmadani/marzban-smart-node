@@ -4,7 +4,7 @@
 MARZBAN_NODE_DIR="$HOME/Marzban-node"
 MARZBAN_NODE_LIB_DIR="/var/lib/marzban-node"
 DOCKER_COMPOSE_FILE="$MARZBAN_NODE_DIR/docker-compose.yml"
-PYTHON_API_HANDLER_SCRIPT="marzban_api_handler_auto.py" # Custom Python script name
+PYTHON_API_HANDLER_SCRIPT="marzban_api_handler_custom.py" # Our custom Python script
 
 # --- Helper Functions (Finglish) ---
 log_info() {
@@ -37,23 +37,24 @@ install_python_library_pip() {
 # Function to check if a port is in use by ANY service defined in docker-compose.yml
 is_port_in_use_in_compose() {
     local port_to_check="$1"
+    # Check if the port is used in any SERVICE_PORT or XRAY_API_PORT in any service environment section
     awk -v p="$port_to_check" '
         /^\s*-/ {in_ports_block=1; next} # Lines starting with - in ports section
-        /^\s*environment:/ {in_ports_block=0} # End of ports section or new block
+        /^\s*ports:/ {in_ports_block=1; next} # Explicit ports block
+        /^\s*environment:/ {in_env_block=1; next} # Environment block
+        /^[a-zA-Z0-9_-]+:$/ {in_ports_block=0; in_env_block=0} # New service block
+
         in_ports_block {
             split($0, arr, ":"); # Split by : for port mapping
             # Check the external port (before colon)
-            gsub(/ /, "", arr[1]); # Remove spaces
+            gsub(/ /, "", arr[1]); # Remove quotes
             if (arr[1] == p) {found=1; exit}
         }
-        # Also check ports in environment variables (for network_mode: host)
-        /SERVICE_PORT:\s*\"?'"'"?[[:digit:]]+/ {
-            gsub(/[^0-9]/, "", $0); # Keep only digits
-            if ($0 == p) {found=1; exit}
-        }
-        /XRAY_API_PORT:\s*\"?'"'"?[[:digit:]]+/{
-            gsub(/[^0-9]/, "", $0); # Keep only digits
-            if ($0 == p) {found=1; exit}
+        in_env_block {
+            if ($1 == "SERVICE_PORT:" || $1 == "XRAY_API_PORT:") {
+                gsub(/"/, "", $NF); # Remove quotes
+                if ($NF == p) {found=1; exit}
+            }
         }
         END {exit !found}
     ' "$DOCKER_COMPOSE_FILE" >/dev/null 2>&1
@@ -125,7 +126,7 @@ check_prerequisites() {
     fi
     
     # Install requests needed by our custom Python script
-    if ! python3 -c "import requests" &> /dev/null; then
+    if ! check_python_library "requests"; then
         log_info "Python 'requests' library not found. Installing..."
         install_python_library_pip "requests"
     fi
@@ -158,7 +159,7 @@ setup_custom_python_api_handler() {
     log_info "Setting up custom Python API handler script for Marzban interaction."
     
     # Create the Python script for API interaction directly
-    cat << EOF > "$MARZBAN_NODE_DIR/$PYTHON_API_HANDLER_SCRIPT"
+    cat << 'EOF' > "$MARZBAN_NODE_DIR/$PYTHON_API_HANDLER_SCRIPT"
 import requests
 import json
 import sys
@@ -177,7 +178,7 @@ def get_token(panel_protocol, panel_domain, panel_port, username, password):
     panel_api_url = f"{panel_protocol}://{panel_domain}"
     if not ((panel_protocol == "http" and panel_port == "80") or (panel_protocol == "https" and panel_port == "443")):
         panel_api_url += f":{panel_port}"
-    panel_api_url += "/api/admin/token" # ItsAML's script uses /api/admin/token
+    panel_api_url += "/api/admin/token" # Marzban's standard API token endpoint
 
     log_py(f"Attempting to login to {panel_api_url}...")
     headers = {"Content-Type": "application/json"}
@@ -195,7 +196,7 @@ def get_client_cert(panel_protocol, panel_domain, panel_port, token):
     panel_api_url = f"{panel_protocol}://{panel_domain}"
     if not ((panel_protocol == "http" and panel_port == "80") or (panel_protocol == "https" and panel_port == "443")):
         panel_api_url += f":{panel_port}"
-    panel_api_url += "/api/admin/nodes/certificate" # ItsAML's script uses /api/node/settings
+    panel_api_url += "/api/admin/nodes/certificate" # Marzban's standard API endpoint for node cert
 
     log_py(f"Attempting to retrieve client certificate from {panel_api_url}...")
     headers = {"Authorization": f"Bearer {token}"}
@@ -213,7 +214,7 @@ def add_node_to_panel(panel_protocol, panel_domain, panel_port, token, node_name
     panel_api_url = f"{panel_protocol}://{panel_domain}"
     if not ((panel_protocol == "http" and panel_port == "80") or (panel_protocol == "https" and panel_port == "443")):
         panel_api_url += f":{panel_port}"
-    panel_api_url += "/api/admin/nodes" # ItsAML's script uses /api/node
+    panel_api_url += "/api/admin/nodes" # Marzban's standard API endpoint for adding nodes
 
     log_py(f"Attempting to add node '{node_name}' to {panel_api_url}...")
     headers = {
@@ -247,7 +248,7 @@ def add_node_to_panel(panel_protocol, panel_domain, panel_port, token, node_name
 if __name__ == "__main__":
     # Arguments: <panel_domain> <panel_port> <panel_protocol_bool_str> <username> <password> <node_name> <node_address> <service_port> <api_port> <add_as_new_host_bool_str>
     if len(sys.argv) < 11:
-        log_py("Usage: python marzban_api_handler_auto.py <domain> <port> <https_bool> <username> <password> <node_name> <node_address> <service_port> <api_port> <add_as_new_host_bool_str>")
+        log_py("Usage: python marzban_api_handler_custom.py <domain> <port> <https_bool> <username> <password> <node_name> <node_address> <service_port> <api_port> <add_as_new_host_bool_str>")
         sys.exit(1)
 
     panel_domain = sys.argv[1]
@@ -274,167 +275,14 @@ if __name__ == "__main__":
     # Print cert_content to stdout as the ONLY thing for Bash to capture for cert file
     print(cert_content)
 
-    # Add Node to Panel
     if not add_node_to_panel(panel_domain, panel_port, https_enabled, token, node_name, node_address, service_port, api_port, add_as_new_host):
         sys.exit(1)
-    
+
     sys.exit(0) # Explicitly exit with 0 on success
 EOF
     
     chmod +x "$MARZBAN_NODE_DIR/$PYTHON_API_HANDLER_SCRIPT" || log_error "Failed to make Python script executable."
     log_info "Python API handler setup complete."
-}
-
-# --- Main Logic to Add Node ---
-add_new_node_to_system() {
-    log_info "Adding new Marzban Node service to Docker Compose and Panel..."
-
-    local new_service_name
-    local service_port
-    local api_port
-    local client_cert_file_path
-    local panel_domain_input # Panel domain (e.g., your-panel.com or 1.2.3.4)
-    local use_https_input # y/n
-    local panel_port_input   # Panel port (e.g., 80, 443, 2003)
-    local panel_username
-    local panel_password
-    local node_display_address
-    local add_as_host_flag_input # y/n
-    local add_as_new_host_bool # True/False for Python script
-    local use_auto_ports
-
-    log_info "\n--- Enter details for the NEW Marzban Node and Panel connection ---"
-    read -p "Enter Marzban Panel Domain (e.g., your-panel.com or 1.2.3.4): " panel_domain_input
-    
-    read -p "Is your Marzban Panel using HTTPS (y/n)? " use_https_input
-    
-    read -p "Enter Marzban Panel Port (e.g., 80, 443, 2003): " panel_port_input
-    while [[ ! "$panel_port_input" =~ ^[0-9]+$ ]] || [ "$panel_port_input" -lt 1 ]; do
-        log_warning "Invalid port. Please enter a valid positive integer."
-        read -p "Enter Marzban Panel Port (e.g., 80, 443, 2003): " panel_port_input
-    done
-    
-    # --- Input Panel Authentication ---
-    read -p "Enter Marzban Panel Username: " panel_username
-    read -s -p "Enter Marzban Panel Password: " panel_password # -s hides input
-    echo # New line after password input
-
-    # --- Node Service Details ---
-    read -p "Enter a UNIQUE name for this new node service in Docker (e.g., my-new-node): " new_service_name
-    while grep -q "services:\s*$new_service_name:" "$DOCKER_COMPOSE_FILE" 2>/dev/null; do
-        log_warning "Service name '$new_service_name' already exists in docker-compose.yml. Please choose a different name."
-        read -p "Enter a unique name for this new node service: " new_service_name
-    done
-
-    read -p "Do you want to auto-assign SERVICE_PORT and XRAY_API_PORT (y/n)? (e.g., 61000, 61001): " use_auto_ports
-    if [[ "$use_auto_ports" =~ ^[Yy]$ ]]; then
-        service_port=$(get_random_free_port)
-        if [ -z "$service_port" ]; then
-            log_error "Could not find any free SERVICE_PORT automatically. Please try again manually or free up ports."
-        fi
-        api_port=$((service_port + 1)) # Try next sequential port
-        while is_port_in_use_in_compose "$api_port" || sudo netstat -tuln | grep -q ":$api_port\b"; do
-            api_port=$((api_port + 1))
-        done
-
-        log_info "Auto-assigned SERVICE_PORT: $service_port, XRAY_API_PORT: $api_port"
-    else
-        read -p "Enter SERVICE_PORT for this new node: " service_port
-        while [[ ! "$service_port" =~ ^[0-9]+$ ]] || [ "$service_port" -lt 1 ] || is_port_in_use_in_compose "$service_port" || sudo netstat -tuln | grep -q ":$service_port\b"; do
-            if [[ ! "$service_port" =~ ^[0-9]+$ ]] || [ "$service_port" -lt 1 ]; then
-                log_warning "Invalid port. Please enter a valid positive integer."
-            else
-                log_warning "Port '$service_port' is already in use or used by another service in docker-compose.yml. Please choose a different port."
-            fi
-            read -p "Enter SERVICE_PORT for this new node: " service_port
-        done
-
-        read -p "Enter XRAY_API_PORT for this new node: " api_port
-        while [[ ! "$api_port" =~ ^[0-9]+$ ]] || [ "$api_port" -lt 1 ] || is_port_in_use_in_compose "$api_port" || sudo netstat -tuln | grep -q ":$api_port\b"; do
-            if [[ ! "$api_port" =~ ^[0-9]+$ ]] || [ "$api_port" -lt 1 ]; then
-                log_warning "Invalid port. Please enter a valid positive integer."
-            else
-                log_warning "Port '$api_port' is already in use or used by another service in docker-compose.yml. Please choose a different port."
-            fi
-            read -p "Enter XRAY_API_PORT for this new node: " api_port
-        done
-    fi
-
-    # Get Node's own public IP for Panel Address (optional, user can provide domain)
-    local public_ip=$(curl -s api.ipify.org)
-    read -p "Enter Node's Address for Marzban Panel (your node's public IP or a domain, e.g., $public_ip or node.yourdomain.com): " node_display_address
-    node_display_address=${node_display_address:-$public_ip} # Use public IP as default
-
-    read -p "Do you want to add this node as a new host for every inbound in Marzban Panel (y/n)? " add_as_host_flag_input
-    if [[ "$add_as_host_flag_input" =~ ^[Yy]$ ]]; then
-        add_as_new_host_bool="True"
-    else
-        add_as_new_host_bool="False"
-    fi
-
-
-    client_cert_file_path="${MARZBAN_NODE_LIB_DIR}/ssl_client_cert_${new_service_name}.pem"
-
-    # --- Use Python script for API interaction ---
-    log_info "Attempting to interact with Marzban Panel API via Python script..."
-    log_info "Running Python script to get token, client cert, and add node..."
-
-    # Convert Bash boolean-like strings to Python boolean strings
-    local panel_https_bool="False"
-    if [[ "$use_https_input" =~ ^[Yy]$ ]]; then
-        panel_https_bool="True"
-    fi
-
-    # Run Python script and capture its output (stderr is redirected to stdout for logging)
-    local py_output
-    # Pass all arguments to Python script
-    py_output=$( python3 "$MARZBAN_NODE_DIR/$PYTHON_API_HANDLER_SCRIPT" \
-        "$panel_domain_input" "$panel_port_input" "$panel_https_bool" \
-        "$panel_username" "$panel_password" \
-        "$new_service_name" "$node_display_address" "$service_port" "$api_port" \
-        "$add_as_new_host_bool" 2>&1 )
-
-    local py_exit_code=$?
-    log_info "Python script raw output:"
-    echo "$py_output" | sed 's/^/\t/' # Indent Python script output for readability
-
-    if [ "$py_exit_code" -ne 0 ]; then
-        log_error "Python script failed to interact with Marzban API. Please check panel details and logs above for errors."
-    fi
-
-    # Extract certificate content (it's the only direct print to stdout)
-    local client_cert_content=$(echo "$py_output" | awk '/-----BEGIN CERTIFICATE-----/{flag=1; print $0; next} /-----END CERTIFICATE-----/{print $0; flag=0; next} flag') 
-    
-    # Verify cert_content is a certificate
-    if [ -z "$client_cert_content" ] || ! echo "$client_cert_content" | grep -q '-----BEGIN CERTIFICATE-----'; then # Check if cert_content is empty or invalid
-        log_error "Failed to retrieve a valid SSL Client Certificate from Python script output. This is critical. Check Python script logs above for errors."
-    fi
-
-    # Save Client Certificate to file
-    echo -e "$client_cert_content" | sudo tee "$client_cert_file_path" >/dev/null || log_error "Failed to save certificate."
-    sudo chmod 644 "$client_cert_file_path" || log_warning "Failed to change certificate permissions."
-    log_info "SSL Client Certificate saved to $client_cert_file_path."
-
-    # Append new service to docker-compose.yml
-    cat << EOF >> "$DOCKER_COMPOSE_FILE"
-
-  $new_service_name:
-    image: gozargah/marzban-node:latest
-    restart: always
-    network_mode: host
-    environment:
-      SSL_CLIENT_CERT_FILE: "$client_cert_file_path"
-      SERVICE_PORT: "$service_port"
-      XRAY_API_PORT: "$api_port"
-      SERVICE_PROTOCOL: "rest"
-    volumes:
-      - $MARZBAN_NODE_LIB_DIR:/var/lib/marzban-node
-      - /var/lib/marzban:/var/lib/marzban
-EOF
-
-    log_info "New service '$new_service_name' added to docker-compose.yml for Docker Compose."
-    log_info "Updated docker-compose.yml content:"
-    cat "$DOCKER_COMPOSE_FILE"
 }
 
 # --- Main Execution Flow ---
